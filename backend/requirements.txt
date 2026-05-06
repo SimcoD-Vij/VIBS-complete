@@ -1,0 +1,50 @@
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+websockets==12.0
+python-multipart==0.0.9
+
+# Database
+sqlalchemy==2.0.30
+asyncpg==0.29.0
+alembic==1.13.1
+psycopg2-binary==2.9.9
+
+# Task queue
+celery==5.4.0
+redis==5.0.4
+
+# ML - Audio
+torch==2.2.2
+torchaudio==2.2.2
+faster-whisper==1.0.3
+pyannote.audio==3.3.1
+speechbrain==1.0.0
+silero-vad==5.1
+soundfile==0.12.1
+librosa==0.10.2
+numpy==1.26.4
+scipy==1.13.0
+
+# ML - NLP
+langchain==0.2.1
+langchain-openai==0.1.8
+langchain-groq==0.1.9
+langchain-anthropic==0.1.23
+langchain-community==0.2.1
+openai==1.30.1
+
+# Export / Utils
+weasyprint==62.1
+markdown==3.6
+aiofiles==23.2.1
+httpx==0.27.0
+pydantic==2.7.1
+pydantic-settings==2.2.1
+python-dotenv==1.0.1
+scikit-learn==1.5.0
+
+# GPU detection
+gputil==1.4.0
+
+# Library compatibility fixes
+huggingface_hub==0.23.0

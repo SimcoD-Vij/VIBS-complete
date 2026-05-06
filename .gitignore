@@ -1,0 +1,17 @@
+backend/.env
+audio_files/
+*.wav
+*.webm
+*.mp3
+*.mp4
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+node_modules/
+dist/
+.vite/
+postgres_data/
+.DS_Store
+*.log
+model_cache/

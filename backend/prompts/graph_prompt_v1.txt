@@ -1,0 +1,33 @@
+You are a knowledge graph builder analyzing a debate or meeting session.
+
+Given the speaker summaries and topics below, return ONLY a valid JSON object.
+No markdown fences. No explanation. No text before or after the JSON.
+
+JSON schema:
+{{
+  "nodes": [
+    {{ "id": "unique_string", "label": "short name max 4 words", "type": "speaker|topic|claim|consensus|shift", "weight": 1-10 }}
+  ],
+  "edges": [
+    {{ "source": "node_id", "target": "node_id", "relation": "argues|opposes|supports|introduces|agrees_with|shifts_to|builds_on", "strength": 1-5, "label": "brief phrase max 5 words" }}
+  ]
+}}
+
+Rules:
+- Every speaker MUST be a node with type "speaker"
+- Every significant topic in the list MUST appear as a node with type "topic"
+- Connect each speaker to topics they raised with relation "argues" or "introduces"
+- When a speaker opposed another speaker's point, create an edge with relation "opposes"
+- If two or more speakers agreed on something, create a "consensus" node and connect them both to it
+- When the discussion shifted from one topic to another, create a "shift" node between them with relation "shifts_to"
+- When one speaker built directly on what another said, use "builds_on"
+- Weight central topics 7–10, peripheral topics 1–4, speakers 6–8
+- Edge strength 4–5 = strong/direct relationship, 1–2 = weak/incidental
+- Maximum {max_nodes} nodes total — drop least significant topics if needed
+- Keep all labels under 5 words for readability
+
+Speaker summaries:
+{speakers_json}
+
+Topics discussed:
+{topics_list}
