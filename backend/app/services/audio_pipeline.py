@@ -81,7 +81,10 @@ def get_embedding_model():
             return _embedding_model
         try:
             logger.info("Loading speaker embedding model (speechbrain ECAPA-TDNN)...")
-            from speechbrain.pretrained import EncoderClassifier
+            try:
+                from speechbrain.inference.classifiers import EncoderClassifier
+            except ImportError:
+                from speechbrain.pretrained import EncoderClassifier
 
             _embedding_model = EncoderClassifier.from_hparams(
                 source="speechbrain/spkrec-ecapa-voxceleb",
@@ -200,6 +203,11 @@ def get_speaker_embedding(audio_np: np.ndarray, sample_rate: int = 16000) -> Opt
         return None
 
     try:
+        audio_np = audio_np.astype(np.float32)
+        peak = np.abs(audio_np).max()
+        if peak > 0.0:
+            audio_np = audio_np / peak
+
         device = _device if _device != "mps" else "cpu"
         waveform = torch.tensor(audio_np, dtype=torch.float32).unsqueeze(0).to(device)
 

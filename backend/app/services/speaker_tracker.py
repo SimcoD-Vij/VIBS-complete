@@ -140,10 +140,14 @@ class RealtimeSpeakerTracker:
                     # Enough evidence for a new speaker
                     if self._speaker_count >= self.max_speakers:
                         # Too many speakers — assign to closest anyway
-                        self._update_embedding(best_id, embedding)
-                        self._update_meta(best_id, duration)
+                        if best_id is not None:
+                            self._update_embedding(best_id, embedding)
+                            self._update_meta(best_id, duration)
+                            color = self._speaker_meta[best_id]["color"]
+                        else:
+                            best_id = list(self._mean_embeddings.keys())[0]
+                            color = self._speaker_meta[best_id]["color"]
                         self._pending_embs = []
-                        color = self._speaker_meta[best_id]["color"]
                         return best_id, color, best_score
                     
                     # Create new speaker using median of pending embeddings
@@ -153,8 +157,12 @@ class RealtimeSpeakerTracker:
                     return new_spk, color, conf
                 else:
                     # Not enough votes yet — return closest match while waiting
-                    self._update_meta(best_id, duration) # attribute to closest for now
-                    color = self._speaker_meta[best_id]["color"]
+                    if best_id is not None:
+                        self._update_meta(best_id, duration) # attribute to closest for now
+                        color = self._speaker_meta[best_id]["color"]
+                    else:
+                        best_id = list(self._mean_embeddings.keys())[0]
+                        color = self._speaker_meta[best_id]["color"]
                     return best_id, color, best_score
 
     def _assign_by_energy(self, audio_np: np.ndarray, duration: float) -> tuple[str, str, float]:
