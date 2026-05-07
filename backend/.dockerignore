@@ -1,0 +1,12 @@
+models/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.env
+.git
+.gitignore
+*.pdf
+audio_files/

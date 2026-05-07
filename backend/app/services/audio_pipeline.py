@@ -295,15 +295,15 @@ def transcribe_audio_chunk(
     try:
         segments_gen, _ = whisper.transcribe(
             audio_np,
-            beam_size=1,
+            beam_size=2,                    # Increase from 1 to 2 for better accuracy
             language="en" if settings.WHISPER_MODEL.endswith(".en") else None,
             initial_prompt=initial_prompt,
             vad_filter=False,               # we already ran Silero — skip built-in VAD
-            condition_on_previous_text=False,
+            condition_on_previous_text=True, # Enable context awareness
             word_timestamps=False,
-            no_speech_threshold=0.8,
-            compression_ratio_threshold=2.8,
-            log_prob_threshold=-1.2,
+            no_speech_threshold=0.6,        # More sensitive to speech
+            compression_ratio_threshold=2.4, # Stricter on repetition
+            log_prob_threshold=-1.0,        # Filter out low-confidence hallucinations
         )
         results = []
         for seg in segments_gen:
