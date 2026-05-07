@@ -20,13 +20,13 @@ RUN ln -sf /usr/bin/python3.11 /usr/bin/python3 && \
 
 WORKDIR /app
 
-COPY requirements.txt .
-
-# Install PyTorch with CUDA support first
+# Install PyTorch with CUDA support first (Done BEFORE copying requirements.txt to cache the 750MB download)
 RUN pip install --no-cache-dir \
     torch==2.2.2 \
     torchaudio==2.2.2 \
     --index-url https://download.pytorch.org/whl/cu121
+
+COPY requirements.txt .
 
 # Install remaining packages
 RUN pip install --no-cache-dir -r requirements.txt
