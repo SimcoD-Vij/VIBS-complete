@@ -14,36 +14,61 @@
  * Output: ArrayBuffer of Float32 samples at 16kHz mono
  * Backend reads: np.frombuffer(raw_bytes, dtype=np.float32)
  */
+const TARGET_RATE   = 16000
+const CHUNK_SAMPLES = 3200
+
 class AudioProcessor extends AudioWorkletProcessor {
   constructor(options) {
     super()
-    // Accumulate samples until we have enough for a chunk
-    // 3200 samples = 0.2 seconds at 16kHz
-    // We accumulate 10 of these → 32000 samples = 2 seconds processed on backend
-    this._chunkSamples = (options?.processorOptions?.chunkSamples) || 3200
-    this._buffer = new Float32Array(this._chunkSamples * 4) // pre-alloc
-    this._writePos = 0
+    this._chunkSamples = options?.processorOptions?.chunkSamples || CHUNK_SAMPLES
+    this._buffer    = new Float32Array(this._chunkSamples * 8)
+    this._writePos  = 0
+    this._srcRate   = sampleRate          // ← actual rate from AudioWorkletGlobalScope
+    this._ratio     = this._srcRate / TARGET_RATE   // e.g. 44100/16000 = 2.75625
+    this._resampPos = 0.0
   }
 
   process(inputs) {
     const channel = inputs?.[0]?.[0]
-    if (!channel) return true // keep processor alive
+    if (!channel || channel.length === 0) return true
 
-    // AudioWorklet delivers 128 samples per frame at the native sample rate.
-    // We receive these at whatever rate the AudioContext runs (usually 44100 or 48000).
-    // The AudioContext is created at 16000 Hz so we receive 128 samples at 16kHz each frame.
-    for (let i = 0; i < channel.length; i++) {
-      this._buffer[this._writePos++] = channel[i]
+    if (Math.abs(this._ratio - 1.0) < 0.01) {
+      this._pushSamples(channel)           // already 16 kHz, copy directly
+    } else {
+      const resampled = this._resample(channel)  // downsample via linear interp
+      this._pushSamples(resampled)
+    }
+    return true
+  }
 
+  _resample(input) {
+    const outLen = Math.floor(input.length / this._ratio) + 2
+    const out    = new Float32Array(outLen)
+    let outIdx   = 0
+
+    while (outIdx < outLen) {
+      const srcIdxFloat = this._resampPos
+      const srcIdx      = Math.floor(srcIdxFloat)
+      if (srcIdx >= input.length - 1) break
+
+      const frac = srcIdxFloat - srcIdx
+      out[outIdx++] = input[srcIdx] * (1 - frac) + input[srcIdx + 1] * frac
+      this._resampPos += this._ratio
+    }
+
+    this._resampPos = this._resampPos % this._ratio
+    return out.subarray(0, outIdx)
+  }
+
+  _pushSamples(samples) {
+    for (let i = 0; i < samples.length; i++) {
+      this._buffer[this._writePos++] = samples[i]
       if (this._writePos >= this._chunkSamples) {
-        // Copy and send — transfer ownership of buffer for zero-copy
         const out = this._buffer.slice(0, this._chunkSamples)
         this.port.postMessage(out.buffer, [out.buffer])
         this._writePos = 0
       }
     }
-
-    return true // returning false stops the processor
   }
 }
 

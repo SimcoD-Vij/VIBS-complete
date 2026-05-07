@@ -80,6 +80,7 @@ export function useRealtimeStream() {
       // 2. Set up Web Audio API analyser (for waveform)
       const audioCtx = new AudioContext({ sampleRate: 16000 })
       const source = audioCtx.createMediaStreamSource(stream)
+      await audioCtx.resume()
       const analyser = audioCtx.createAnalyser()
       analyser.fftSize = 512
       source.connect(analyser)
@@ -88,6 +89,7 @@ export function useRealtimeStream() {
 
       // 3. Connect WebSocket
       const ws = new WebSocket(`${WS_URL}/ws/realtime/${newSessionId}`)
+      console.log(`Connecting to WebSocket: ${WS_URL}/ws/realtime/${newSessionId}`)
       ws.binaryType = 'blob'
       wsRef.current = ws
 
@@ -98,6 +100,7 @@ export function useRealtimeStream() {
           sample_rate: 16000,
           audio_format: 'pcm_f32',
         }))
+        console.log(`Sent config: 16kHz target, actual rate: ${audioCtx.sampleRate}`)
 
         try {
           // Load AudioWorklet
@@ -109,6 +112,14 @@ export function useRealtimeStream() {
           
           workletNode.port.onmessage = (e) => {
             if (ws.readyState === WebSocket.OPEN) {
+              // Quick check: is there actual signal?
+              const samples = new Float32Array(e.data)
+              const max = samples.reduce((a, b) => Math.max(a, Math.abs(b)), 0)
+              if (max > 0.01) {
+                // Signal detected
+              } else if (max > 0) {
+                // Very quiet signal
+              }
               ws.send(e.data)
             }
           }
@@ -171,11 +182,33 @@ export function useRealtimeStream() {
         setDeviceInfo({ device: msg.device, model: msg.model })
         break
 
+      case 'partial':
+        setSegments(prev => {
+          // Check if we already have a segment for this chunk
+          const exists = prev.find(s => s.chunk_index === msg.chunk_index && s.speaker === msg.speaker)
+          if (exists) return prev
+          
+          return [...prev, {
+            id: `partial_${msg.speaker}_${msg.chunk_index}`,
+            speaker: msg.speaker,
+            color: msg.color,
+            text: '...', // Placeholder
+            start: msg.start,
+            end: msg.start + 1.0, 
+            confidence: 0,
+            chunk_index: msg.chunk_index,
+            isPartial: true
+          }]
+        })
+        break
+
       case 'segment':
         if (msg.text) {
           setSegments(prev => {
-            // Merge with previous segment from same speaker if within 1s
-            const last = prev[prev.length - 1]
+            // Remove any partial segment for this chunk
+            const filtered = prev.filter(s => !(s.chunk_index === msg.chunk_index && s.speaker === msg.speaker && s.isPartial))
+            
+            const last = filtered[filtered.length - 1]
             if (
               last &&
               last.speaker === msg.speaker &&
@@ -183,11 +216,11 @@ export function useRealtimeStream() {
               msg.chunk_index === last.chunk_index
             ) {
               return [
-                ...prev.slice(0, -1),
+                ...filtered.slice(0, -1),
                 { ...last, text: last.text + ' ' + msg.text, end: msg.end },
               ]
             }
-            return [...prev, {
+            return [...filtered, {
               id: `${msg.speaker}_${msg.start}_${msg.chunk_index}`,
               speaker: msg.speaker,
               color: msg.color,

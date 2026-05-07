@@ -44,7 +44,8 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.config import settings
 from app.services.speaker_tracker import get_or_create_tracker, release_tracker
-from app.services.audio_pipeline import transcribe_audio_np, run_vad, get_vad
+from app.services.audio_pipeline import run_vad, get_vad
+
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -100,7 +101,8 @@ def pcm_bytes_to_np(raw_bytes: bytes) -> Optional[np.ndarray]:
     """
     try:
         return np.frombuffer(raw_bytes, dtype=np.float32)
-    except Exception:
+    except Exception as e:
+        logger.error(f"pcm_bytes_to_np failed: {e}, len={len(raw_bytes)}")
         return None
 
 
@@ -122,27 +124,32 @@ async def realtime_ws(websocket: WebSocket, session_id: str):
     logger.info(f"Realtime session started: {session_id}")
 
     # Send connection info
+    import torch
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
     await websocket.send_text(json.dumps({
         "type": "connected",
         "session_id": session_id,
-        "device": settings.device,
-        "model": settings.WHISPER_MODEL,
+        "device": dev,
+        "model": "small.en",
         "chunk_seconds": CHUNK_SECONDS,
-        "message": f"Connected · Running on {settings.device.upper()}"
+        "message": f"Connected · Running on {dev.upper()}"
     }))
 
     tracker = get_or_create_tracker(session_id)
 
-    # Accumulation state
-    pcm_buffer = np.array([], dtype=np.float32)  # rolling audio buffer
-    overlap_buffer = np.array([], dtype=np.float32)  # kept between chunks
+    # Audio buffers
+    pcm_buffer = np.array([], dtype=np.float32)
+    overlap_buffer = np.array([], dtype=np.float32)
+    full_audio_record = []  # Store all chunks to save the file later
     chunk_index = 0
     session_start = time.time()
     timeline_offset = 0.0  # seconds of audio processed so far
+    total_samples_processed = 0 # for accurate timing
     all_segments = []
 
     # Audio format: webm (from MediaRecorder) vs raw PCM (from direct stream)
     audio_format = "webm"  # default — browser MediaRecorder
+    client_sample_rate = SAMPLE_RATE
 
     try:
         while True:
@@ -161,7 +168,8 @@ async def realtime_ws(websocket: WebSocket, session_id: str):
 
                 if msg.get("type") == "config":
                     audio_format = msg.get("audio_format", "webm")
-                    logger.info(f"Session {session_id}: audio_format={audio_format}")
+                    client_sample_rate = msg.get("sample_rate", SAMPLE_RATE)
+                    logger.info(f"Session {session_id}: config received: format={audio_format}, rate={client_sample_rate}")
 
                 elif msg.get("type") == "stop":
                     logger.info(f"Session {session_id}: stop received")
@@ -183,6 +191,9 @@ async def realtime_ws(websocket: WebSocket, session_id: str):
             if not raw_bytes:
                 continue
 
+            if chunk_index == 0 and len(pcm_buffer) == 0:
+                logger.warning(f"Session {session_id}: Received first audio bytes ({len(raw_bytes)} bytes). Hex: {raw_bytes[:16].hex()}")
+
             # Convert to PCM float32
             if audio_format == "webm":
                 audio_chunk = await asyncio.get_event_loop().run_in_executor(
@@ -191,38 +202,73 @@ async def realtime_ws(websocket: WebSocket, session_id: str):
             else:
                 # Client is sending raw float32 PCM directly
                 audio_chunk = pcm_bytes_to_np(raw_bytes)
+                if audio_chunk is None:
+                    # Fallback if the client is actually sending webm but claimed pcm_f32
+                    audio_chunk = await asyncio.get_event_loop().run_in_executor(
+                        None, webm_chunk_to_pcm, raw_bytes
+                    )
 
-            if audio_chunk is None or len(audio_chunk) < 512:
+            if audio_chunk is None or len(audio_chunk) < 128:
+                logger.warning(f"Session {session_id}: Chunk decoding failed or too small. audio_chunk is None: {audio_chunk is None}, len(raw_bytes): {len(raw_bytes)}")
                 continue
+                
+            logger.debug(f"Session {session_id}: Decoded {len(audio_chunk)} samples")
+            
+            # Save chunk to full recording
+            full_audio_record.append(audio_chunk)
 
-            # Prepend overlap from previous chunk
-            combined = np.concatenate([overlap_buffer, audio_chunk])
-            pcm_buffer = np.concatenate([pcm_buffer, combined])
-            overlap_buffer = np.array([], dtype=np.float32)  # Clear it so it doesn't get prepended again until next process cycle
+            # Resample to 16kHz if needed
+            if client_sample_rate != SAMPLE_RATE:
+                try:
+                    # Basic linear resampling for speed in realtime
+                    # (In a real prod app, use librosa or samplerate lib)
+                    import librosa
+                    audio_chunk = librosa.resample(audio_chunk, orig_sr=client_sample_rate, target_sr=SAMPLE_RATE)
+                except ImportError:
+                    # Fallback: very basic step-based downsampling
+                    if client_sample_rate > SAMPLE_RATE:
+                        step = client_sample_rate // SAMPLE_RATE
+                        audio_chunk = audio_chunk[::step]
+
+            # Prepend the saved overlap tail, then accumulate
+            pcm_buffer = np.concatenate([overlap_buffer, audio_chunk])
+            overlap_buffer = np.array([], dtype=np.float32)
 
             # Check if we have enough for a processing chunk
             if len(pcm_buffer) < CHUNK_SAMPLES:
+                # Not enough yet — keep everything as the next overlap seed
+                overlap_buffer = pcm_buffer
+                pcm_buffer = np.array([], dtype=np.float32)
                 continue
 
             # Take CHUNK_SAMPLES, keep OVERLAP_SAMPLES for next iteration
             process_audio = pcm_buffer[:CHUNK_SAMPLES]
+            # Keep the tail (minus overlap) for the next chunk
             overlap_buffer = pcm_buffer[CHUNK_SAMPLES - OVERLAP_SAMPLES:]
-            pcm_buffer = pcm_buffer[CHUNK_SAMPLES:]
+            pcm_buffer = np.array([], dtype=np.float32)
 
-            chunk_start = timeline_offset
-            chunk_end = timeline_offset + CHUNK_SECONDS
-            timeline_offset += CHUNK_SECONDS - (OVERLAP_SAMPLES / SAMPLE_RATE)  # adjust for overlap
+            chunk_start = total_samples_processed / SAMPLE_RATE
+            chunk_end = chunk_start + CHUNK_SECONDS
+            
+            # Update for NEXT chunk (stepping forward by 1.5s if overlap is 0.5s)
+            total_samples_processed += (CHUNK_SAMPLES - OVERLAP_SAMPLES)
             chunk_index += 1
 
-            # ── Run VAD first (fast, skip silence) ────────────────────────
-            speech_regions = await asyncio.get_event_loop().run_in_executor(
+            # ── Run VAD and Speaker Tracking in parallel (P3b) ────────────
+            vad_task = asyncio.get_event_loop().run_in_executor(
                 None, run_vad, process_audio, SAMPLE_RATE
             )
+            tracker_task = asyncio.get_event_loop().run_in_executor(
+                None, tracker.process_chunk, process_audio, SAMPLE_RATE, chunk_start, chunk_end
+            )
+            
+            speech_regions, (speaker_id, color, confidence) = await asyncio.gather(vad_task, tracker_task)
 
             total_speech = sum(r["end"] - r["start"] for r in speech_regions)
 
-            # If less than 10% speech, skip transcription
-            if total_speech < CHUNK_SECONDS * 0.1:
+            # If less than 5% speech, skip transcription (only skip pure silence)
+            if total_speech < CHUNK_SECONDS * 0.05:
+                logger.info(f"Session {session_id}: Chunk {chunk_index} skipped (silence: {total_speech:.2f}s speech)")
                 await websocket.send_text(json.dumps({
                     "type": "vad",
                     "is_speech": False,
@@ -231,7 +277,9 @@ async def realtime_ws(websocket: WebSocket, session_id: str):
                 }))
                 continue
 
-            # ── Notify frontend: speech detected ──────────────────────────
+            logger.info(f"Session {session_id}: Chunk {chunk_index} processing ({total_speech:.2f}s speech)")
+
+            # ── Notify frontend: speech detected (P3c: Partial message) ───
             await websocket.send_text(json.dumps({
                 "type": "vad",
                 "is_speech": True,
@@ -240,35 +288,33 @@ async def realtime_ws(websocket: WebSocket, session_id: str):
                 "chunk_index": chunk_index,
             }))
 
-            # ── Identify speaker from this chunk ──────────────────────────
-            speaker_id, color, confidence = await asyncio.get_event_loop().run_in_executor(
-                None,
-                tracker.process_chunk,
-                process_audio,
-                SAMPLE_RATE,
-                chunk_start,
-                chunk_end,
-            )
+            # Send partial segment info so UI can show speaker state immediately
+            await websocket.send_text(json.dumps({
+                "type": "partial",
+                "speaker": speaker_id,
+                "color": color,
+                "start": round(chunk_start, 2),
+                "chunk_index": chunk_index,
+            }))
+
+
 
             # ── Transcribe audio chunk ─────────────────────────────────────
-            # Build a context prompt from the last speaker's text
-            context = " ".join(
-                seg["text"] for seg in all_segments[-3:] if seg.get("speaker") == speaker_id
-            )
-
+            from app.services.audio_pipeline import transcribe_audio_chunk
+            
             segments = await asyncio.get_event_loop().run_in_executor(
                 None,
-                transcribe_audio_np,
+                transcribe_audio_chunk,
                 process_audio,
-                SAMPLE_RATE,
-                context or None,
+                SAMPLE_RATE
             )
-
+            
             # ── Stream segments back to client ─────────────────────────────
             for seg in segments:
-                if not seg["text"]:
+                if not seg.get("text"):
                     continue
 
+                logger.info(f"Session {session_id}: Segment: [{speaker_id}] {seg['text']}")
                 adjusted_seg = {
                     "type": "segment",
                     "speaker": speaker_id,
@@ -298,9 +344,25 @@ async def realtime_ws(websocket: WebSocket, session_id: str):
         except Exception:
             pass
     finally:
+        # Save audio file to disk
+        wav_filename = None
+        if full_audio_record:
+            import soundfile as sf
+            from app.config import settings
+            
+            final_audio = np.concatenate(full_audio_record)
+            wav_filename = f"{session_id}.wav"
+            wav_path = settings.AUDIO_DIR / wav_filename
+            try:
+                sf.write(str(wav_path), final_audio, SAMPLE_RATE)
+                logger.info(f"Session {session_id}: Audio saved to {wav_filename}")
+            except Exception as e:
+                logger.warning(f"Failed to save audio for {session_id}: {e}")
+                wav_filename = None
+
         # Save session to DB in background (fire and forget)
         asyncio.create_task(
-            _save_session(session_id, all_segments, tracker, time.time() - session_start)
+            _save_session(session_id, all_segments, tracker, time.time() - session_start, wav_filename)
         )
         release_tracker(session_id)
         try:
@@ -316,7 +378,13 @@ async def realtime_ws(websocket: WebSocket, session_id: str):
         logger.info(f"Session {session_id} ended: {len(all_segments)} segments")
 
 
-async def _save_session(session_id: str, segments: list, tracker, duration: float):
+async def _save_session(
+    session_id: str, 
+    segments: list[dict], 
+    tracker,
+    duration: float,
+    wav_filename: Optional[str] = None
+):
     """
     Save session data to PostgreSQL after recording ends.
     Runs as a background task — does not block the WebSocket close.
@@ -341,6 +409,7 @@ async def _save_session(session_id: str, segments: list, tracker, duration: floa
                 session_rec.progress_percent = 100
                 session_rec.speaker_count = speaker_count
                 session_rec.duration_seconds = duration
+                session_rec.wav_path = wav_filename
             else:
                 session_rec = SessionModel(
                     id=session_id,
@@ -348,7 +417,7 @@ async def _save_session(session_id: str, segments: list, tracker, duration: floa
                     progress_percent=100,
                     speaker_count=speaker_count,
                     duration_seconds=duration,
-                    wav_path=None,
+                    wav_path=wav_filename,
                 )
                 db.add(session_rec)
 
@@ -379,6 +448,41 @@ async def _save_session(session_id: str, segments: list, tracker, duration: floa
 
             await db.commit()
             logger.info(f"Session {session_id} saved to DB ✓")
+            
+        # Generate Knowledge Graph after DB commit to ensure data is available
+        from app.services.graph_service import build_graph_from_summaries, save_graph_to_db, evaluate_graph, explain_graph
+        from app.services.nlp_service import extract_topics, summarize_speaker
+        
+        full_text = " ".join([seg["text"] for seg in segments if seg.get("text")])
+        if full_text.strip():
+            logger.info(f"Session {session_id}: Generating Knowledge Graph...")
+            try:
+                def _generate_graph():
+                    # 1. Extract topics from the full text
+                    topics = extract_topics(full_text)
+                    # 2. Summarize each speaker's contributions
+                    spk_summaries = {}
+                    for spk_id in all_speakers.keys():
+                        spk_text = " ".join([s["text"] for s in segments if s.get("speaker") == spk_id])
+                        if spk_text.strip():
+                            spk_summaries[spk_id] = summarize_speaker(spk_text)
+                    
+                    # 3. Build graph
+                    graph_json = build_graph_from_summaries(spk_summaries, topics)
+                    if graph_json:
+                        # 4. Evaluate and explain
+                        score = evaluate_graph(graph_json)
+                        explanation = explain_graph(graph_json, list(all_speakers.keys()))
+                        
+                        # 5. Save to DB (using a new synchronous DB session for the background thread)
+                        from app.database import SessionLocal
+                        with SessionLocal() as sync_db:
+                            save_graph_to_db(session_id, graph_json, explanation, score, sync_db)
+                            
+                await asyncio.get_event_loop().run_in_executor(None, _generate_graph)
+                logger.info(f"Session {session_id}: Knowledge Graph saved ✓")
+            except Exception as e:
+                logger.warning(f"Knowledge Graph generation failed for {session_id}: {e}")
 
     except Exception as e:
         logger.exception(f"Failed to save session {session_id}: {e}")

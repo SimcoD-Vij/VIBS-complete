@@ -12,9 +12,9 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str = ""
     ANTHROPIC_API_KEY: str = ""
     AUDIO_DIR: Path = Path("/audio_files")
-    WHISPER_MODEL: str = "tiny.en"
-    REALTIME_CHUNK_SECONDS: float = 2.0
-    SPEAKER_SIMILARITY_THRESHOLD: float = 0.72
+    WHISPER_MODEL: str = "small.en"
+    REALTIME_CHUNK_SECONDS: float = 1.0
+    SPEAKER_SIMILARITY_THRESHOLD: float = 0.60
     SILENCE_THRESHOLD_SECONDS: int = 600
     MAX_SPEAKERS: int = 10
 

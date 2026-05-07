@@ -81,12 +81,12 @@ def get_embedding_model():
             return _embedding_model
         try:
             logger.info("Loading speaker embedding model (speechbrain ECAPA-TDNN)...")
-            from pyannote.audio import Model
-            from pyannote.audio.pipelines.speaker_verification import PretrainedSpeakerEmbedding
+            from speechbrain.pretrained import EncoderClassifier
 
-            _embedding_model = PretrainedSpeakerEmbedding(
-                "speechbrain/spkrec-ecapa-voxceleb",
-                device=torch.device(_device if _device != "mps" else "cpu"),
+            _embedding_model = EncoderClassifier.from_hparams(
+                source="speechbrain/spkrec-ecapa-voxceleb",
+                savedir="/tmp/speechbrain_ecapa",
+                run_opts={"device": _device if _device != "mps" else "cpu"}
             )
             logger.info("Speaker embedding model loaded ✓")
         except Exception as e:
@@ -201,13 +201,10 @@ def get_speaker_embedding(audio_np: np.ndarray, sample_rate: int = 16000) -> Opt
 
     try:
         device = _device if _device != "mps" else "cpu"
-        waveform = torch.tensor(audio_np, dtype=torch.float32)
-        if waveform.dim() == 1:
-            waveform = waveform.unsqueeze(0).unsqueeze(0)  # [1, 1, T]
-        waveform = waveform.to(device)
+        waveform = torch.tensor(audio_np, dtype=torch.float32).unsqueeze(0).to(device)
 
         with torch.no_grad():
-            embedding = model(waveform)
+            embedding = model.encode_batch(waveform)
 
         return embedding.cpu().numpy().squeeze()
     except Exception as e:
@@ -250,14 +247,67 @@ def preload_all():
     """Called at server startup to preload all models so first request is fast."""
     import concurrent.futures
     logger.info("Preloading all models...")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
         f1 = ex.submit(get_whisper)
         f2 = ex.submit(get_embedding_model)
         f3 = ex.submit(get_vad)
+        
+        def load_sense_voice():
+            try:
+                from app.services.sense_voice import get_sense_voice
+                get_sense_voice()
+            except Exception as e:
+                logger.warning(f"SenseVoice preload failed: {e}")
+                
+        f4 = ex.submit(load_sense_voice)
         # Wait for all
-        for f in [f1, f2, f3]:
+        for f in [f1, f2, f3, f4]:
             try:
                 f.result(timeout=120)
             except Exception as e:
                 logger.warning(f"Model preload partial failure: {e}")
     logger.info("All models ready ✓")
+
+def transcribe_audio_chunk(
+    audio_np: np.ndarray,
+    sample_rate: int = 16000,
+    initial_prompt: Optional[str] = None,
+) -> list[dict]:
+    if audio_np is None or len(audio_np) < 512:
+        return []
+
+    audio_np = audio_np.astype(np.float32)
+    peak = np.abs(audio_np).max()
+    if peak > 1.0:
+        audio_np = audio_np / peak
+    if peak < 0.001:
+        return []
+
+    whisper = get_whisper()
+    try:
+        segments_gen, _ = whisper.transcribe(
+            audio_np,
+            beam_size=1,
+            language="en" if settings.WHISPER_MODEL.endswith(".en") else None,
+            initial_prompt=initial_prompt,
+            vad_filter=False,               # we already ran Silero — skip built-in VAD
+            condition_on_previous_text=False,
+            word_timestamps=False,
+            no_speech_threshold=0.8,
+            compression_ratio_threshold=2.8,
+            log_prob_threshold=-1.2,
+        )
+        results = []
+        for seg in segments_gen:
+            text = seg.text.strip()
+            if text and seg.no_speech_prob < 0.85:
+                results.append({
+                    "text": text,
+                    "start": max(0.0, seg.start),
+                    "end": seg.end,
+                    "no_speech_prob": seg.no_speech_prob,
+                })
+        return results
+    except Exception as e:
+        logger.warning(f"transcribe_audio_chunk error: {e}")
+        return []

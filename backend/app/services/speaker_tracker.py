@@ -68,6 +68,10 @@ class RealtimeSpeakerTracker:
         self._last_energy = None
         self._energy_history: list[float] = []
 
+        # P2c: 3-vote buffer before creating a new speaker
+        self._pending_embs: list[np.ndarray] = []
+        self._vote_threshold = 3
+
         logger.info(f"SpeakerTracker created for session {session_id}, threshold={threshold}")
 
     def process_chunk(
@@ -125,17 +129,33 @@ class RealtimeSpeakerTracker:
                 self._update_embedding(best_id, embedding)
                 self._update_meta(best_id, duration)
                 self._last_speaker = best_id
+                # Reset pending buffer on match
+                self._pending_embs = []
                 color = self._speaker_meta[best_id]["color"]
                 return best_id, color, best_score
             else:
-                # New speaker
-                if self._speaker_count >= self.max_speakers:
-                    # Too many speakers — assign to closest
-                    self._update_embedding(best_id, embedding)
-                    self._update_meta(best_id, duration)
+                # Potential new speaker — require votes
+                self._pending_embs.append(embedding)
+                if len(self._pending_embs) >= self._vote_threshold:
+                    # Enough evidence for a new speaker
+                    if self._speaker_count >= self.max_speakers:
+                        # Too many speakers — assign to closest anyway
+                        self._update_embedding(best_id, embedding)
+                        self._update_meta(best_id, duration)
+                        self._pending_embs = []
+                        color = self._speaker_meta[best_id]["color"]
+                        return best_id, color, best_score
+                    
+                    # Create new speaker using median of pending embeddings
+                    median_emb = np.median(self._pending_embs, axis=0)
+                    new_spk, color, conf = self._create_speaker(median_emb, duration)
+                    self._pending_embs = []
+                    return new_spk, color, conf
+                else:
+                    # Not enough votes yet — return closest match while waiting
+                    self._update_meta(best_id, duration) # attribute to closest for now
                     color = self._speaker_meta[best_id]["color"]
                     return best_id, color, best_score
-                return self._create_speaker(embedding, duration)
 
     def _assign_by_energy(self, audio_np: np.ndarray, duration: float) -> tuple[str, str, float]:
         """
@@ -204,7 +224,8 @@ class RealtimeSpeakerTracker:
         self._embeddings[spk_id].append(embedding)
         # Keep last 15 embeddings
         self._embeddings[spk_id] = self._embeddings[spk_id][-15:]
-        self._mean_embeddings[spk_id] = np.mean(self._embeddings[spk_id], axis=0)
+        # P2b: Use median instead of mean (more robust to outliers)
+        self._mean_embeddings[spk_id] = np.median(self._embeddings[spk_id], axis=0)
 
     def _update_meta(self, spk_id: str, duration: float):
         """Update speaking time stats. Caller must hold self._lock."""
